@@ -18,21 +18,8 @@ library(broom)
 ```
 
 ```{r}
-# Read in the data
 metrics = read.csv("~/Desktop/macedo_tract/outputs/metrics_df.csv")
-main_metrics <- c('ad', 'area_of_end_region_1_mm2', 'area_of_end_region_2_mm2',
-       'branch_volume_mm3', 'curl', 'diameter_mm', 'dti_fa', 'elongation',
-       'gfa', 'ha', 'irregularity', 'irregularity_of_end_region_1',
-       'irregularity_of_end_region_2', 'md', 'mean_length_mm',
-       'nrdi06L', 'number_of_tracts', 'qa',
-       'radius_of_end_region_1_mm', 'radius_of_end_region_2_mm', 'rd',
-       'rdi', 'span_mm',
-       'total_radius_of_end_regions_mm', 'total_surface_area_mm2',
-       'trunk_volume_mm3', 'txx', 'txy', 'txz', 'tyy', 'tyz', 'tzz',
-       'volume_mm3')
-```
 
-```{r}
 # Clean the data, remove NANs and scale regression variables
 cleaned_metrics <- metrics %>%
   drop_na(score, sex, interview_age, t1_neighbor_corr, brain_size)
@@ -44,60 +31,60 @@ cleaned_metrics$sex <- scale(cleaned_metrics$sex)
 ```
 
 ```{r}
-# ADD "+brain_size" to include brain_size in analysis
-# Define a function to fit the model, with and without brain size
-linear_with_size <- function(df) {
-  lm(score ~ sex + interview_age + t1_neighbor_corr + brain_size, data = df)}
+# Create linear regression model function, with a toggle variable "brain_size" which determines whether or not to include brain size in the model.
+linear_model <- function(df, brain_size=TRUE) {
+  if (brain_size) {lm(score ~ sex + interview_age + t1_neighbor_corr + brain_size, data = df)} 
+  else {lm(score ~ sex + interview_age + t1_neighbor_corr, data = df)}}
+
+linear_reduced <- function(df, brain_size=TRUE) {
+  if (brain_size) {lm(score ~ sex + t1_neighbor_corr + brain_size, data = df)} 
+  else {lm(score ~ sex + t1_neighbor_corr, data = df)}}
 ```
 
 ```{r}
-# Reduced model for partial r^2 analysis 
-linear_reduced <- function(df) {
-  lm(score ~ sex + t1_neighbor_corr + brain_size, data = df)}
-```
-
-```{r}
-# Group the dataframe by the 'bundles' column and apply the fit_model function
+# Group the dataframe by the bundle and metric column and apply the fit_model function
 results <- cleaned_metrics %>%
   group_by(metric, bundle) %>%
-  do(model = linear_with_size(.))
-```
+  do(model = linear_model(.))
 
-```{r}
 # Reduced results (for r^2 analysis, excludes age term)
 reduced_results <- cleaned_metrics %>%
   group_by(metric, bundle) %>%
   do(model = linear_reduced(.))
 ```
 
+** Run either this chunk or the "linear_model" chunk, depending on if you'd like to have a GAM or linear model. ** 
 ```{r}
-# Ensure the models are of class 'lm'
-summary(results$model[[1]])[["coefficients"]]["interview_age", "t value"]
+# GAM with smooth term for age.
+gam_age <- function(df) {
+  gam(score ~ sex + s(interview_age) + t1_neighbor_corr + brain_size, data = df)}
+
+results <- cleaned_metrics %>%
+  group_by(metric, bundle) %>%
+  do(model = gam_age(.))
+
+summary(results$model[[1]])
+plot(results$model[[1]])
 ```
 
-FDR correct "age" p-values per group of metrics, and then check how many p-values survive per metric.
 ```{r}
+# FDR correct "age" p-values per group of metrics, and then check how many p-values survive per metric.
 results$tstat <- 0 
 results$pval <-0 
 for(i in 1:nrow(results)) {
     results$tstat[i] = broom::tidy(results$model[[i]])  %>%
-          filter(term == "interview_age") %>%
+          filter(term == "s(interview_age)") %>%
           pull(statistic)
     
     results$pval[i] = broom::tidy(results$model[[i]])  %>%
-      filter(term == "interview_age") %>%
-      pull(p.value)
-}
-```
+      filter(term == "s(interview_age)") %>%
+      pull(p.value)}
 
-```{r}
 results <- results %>%
   group_by(metric) %>%
   mutate(fdr_pvals = p.adjust(pval, method = "fdr")) %>%
   ungroup()
-```
 
-```{r}
 results <- results %>%
   group_by(metric) %>%
   mutate(surviving_ps = fdr_pvals < 0.05)
@@ -118,7 +105,7 @@ metric_dict$metric <- factor(metric_dict$metric, levels = metric_dict$metric) # 
 ```{r}
 ggplot(metric_dict, aes(x = metric, y = sum_surviving_ps)) +
   geom_col(fill = "#1f77b4") +
-  geom_hline(yintercept = 56, color = "red", size = 0.5) +
+  geom_hline(yintercept = 56, color = "red", linewidth = 0.5) +
   labs(title = "FDR-corrected p-values for the age term in the linear regression with brain size",
        x = "Metric",
        y = "Sum of Surviving PS") +
