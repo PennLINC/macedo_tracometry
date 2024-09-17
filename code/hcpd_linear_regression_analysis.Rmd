@@ -15,6 +15,7 @@ library(broom)
 library(tidyr)
 library(purrr)
 library(broom)
+library(mgcv)
 ```
 
 ```{r}
@@ -31,6 +32,12 @@ cleaned_metrics$sex <- scale(cleaned_metrics$sex)
 ```
 
 ```{r}
+# decide if you are running a gam or a linear model
+is_gam = TRUE
+incl_brain_size = TRUE
+```
+
+```{r}
 # Create linear regression model function, with a toggle variable "brain_size" which determines whether or not to include brain size in the model.
 linear_model <- function(df, brain_size=TRUE) {
   if (brain_size) {lm(score ~ sex + interview_age + t1_neighbor_corr + brain_size, data = df)} 
@@ -39,29 +46,32 @@ linear_model <- function(df, brain_size=TRUE) {
 linear_reduced <- function(df, brain_size=TRUE) {
   if (brain_size) {lm(score ~ sex + t1_neighbor_corr + brain_size, data = df)} 
   else {lm(score ~ sex + t1_neighbor_corr, data = df)}}
+
+# GAM with smooth term for age.
+gam_age <- function(df, brain_size=TRUE) {
+  gam(score ~ sex + s(interview_age) + t1_neighbor_corr + brain_size, data = df)}
 ```
 
 ```{r}
-# Group the dataframe by the bundle and metric column and apply the fit_model function
-results <- cleaned_metrics %>%
-  group_by(metric, bundle) %>%
-  do(model = linear_model(.))
-
 # Reduced results (for r^2 analysis, excludes age term)
 reduced_results <- cleaned_metrics %>%
   group_by(metric, bundle) %>%
-  do(model = linear_reduced(.))
+  do(model = linear_reduced(., incl_brain_size))
 ```
 
 ** Run either this chunk or the "linear_model" chunk, depending on if you'd like to have a GAM or linear model. ** 
 ```{r}
-# GAM with smooth term for age.
-gam_age <- function(df) {
-  gam(score ~ sex + s(interview_age) + t1_neighbor_corr + brain_size, data = df)}
+# Group the dataframe by the bundle and metric column and apply the fit_model function
 
+if (is_gam) {
+  results <- cleaned_metrics %>%
+  group_by(metric, bundle) %>%
+  do(model = gam_age(., incl_brain_size))
+  } else {
 results <- cleaned_metrics %>%
   group_by(metric, bundle) %>%
-  do(model = gam_age(.))
+  do(model = linear_model(., incl_brain_size))
+}
 
 summary(results$model[[1]])
 plot(results$model[[1]])
@@ -106,31 +116,21 @@ metric_dict$metric <- factor(metric_dict$metric, levels = metric_dict$metric) # 
 ggplot(metric_dict, aes(x = metric, y = sum_surviving_ps)) +
   geom_col(fill = "#1f77b4") +
   geom_hline(yintercept = 56, color = "red", linewidth = 0.5) +
-  labs(title = "FDR-corrected p-values for the age term in the linear regression with brain size",
+  labs(title = "FDR-corrected p-values for the age term in the GAM with brain size",
        x = "Metric",
        y = "Sum of Surviving PS") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
 
-```{r}
-main_metrics <- c('area_of_end_region_1_mm2', 'area_of_end_region_2_mm2',
-       'diameter_mm', 'dti_fa', 'md', 'mean_length_mm',
-       'radius_of_end_region_1_mm', 'radius_of_end_region_2_mm', 
-       'total_radius_of_end_regions_mm', 'total_surface_area_mm2',
-       'trunk_volume_mm3',
-       'volume_mm3')
-results_main <- results %>%
-  filter(metric %in% main_metrics)
-```
-
-
 ```{r, fig.width=16, fig.height=8}
+title = "Distribution of t statistic for age in GAM by metric"
 ggplot(results, aes(x = tstat, fill = metric)) +
     geom_density(alpha = 0.5) +  # Density plot with transparency
     geom_vline(xintercept = 0, color = "red") +
+    xlim(c(-20, 30)) +
     facet_wrap(~ metric) +  # Create a separate plot for each unique value in bundle
-    labs(title = "Distribution of t statistic for age in linear regression by metric",
+    labs(title = title,
          x = "t_stat",
          y = "Density") +
     theme_minimal() +
@@ -143,20 +143,22 @@ Take the partial Rs
 # Calculate the partial R^2 for 'age'
 results$partial_r2 <- 0
 for(i in 1:nrow(results)) {
-  full_r2 <- summary(results$model[[i]])$r.squared
+  if (is_gam) {full_r2 <- summary(results$model[[i]])$r.sq}
+  else {full_r2 <- summary(results$model[[i]])$r.squared}
   reduced_r2 <- summary(reduced_results$model[[i]])$r.squared
   results$partial_r2[[i]] <- (full_r2 - reduced_r2)/reduced_r2
 }
 ```
 
 ```{r, fig.width=16, fig.height=8}
+title = "Distribution of Partial R^2 for Age in GAM by Metric"
 ggplot(results, aes(x = partial_r2, fill = metric)) +
     geom_density(alpha = 0.5) +  # Density plot with transparency
     geom_vline(xintercept = 0, color = "red") +  # Add vertical line at x = 0
     facet_wrap(~ metric) +  # Create a separate plot for each unique value in metric
     xlim(c(-1, 2)) +
     ylim(c(0, 5)) +
-    labs(title = "Distribution of Partial R^2 for Age in Linear Regression by Metric",
+    labs(title = title,
          x = "Partial R^2",
          y = "Density") +
     theme_minimal() +
