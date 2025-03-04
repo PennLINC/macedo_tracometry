@@ -1,0 +1,886 @@
+---
+title: "hcpd_regression"
+author: "Briana Macedo"
+date: '2024-09-05'
+output: html_document
+output_file: "zero-centered-smooths.html" 
+output_dir: "~/Desktop/Main/macedo_tract/macedo_tracometry-main/plots/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+setwd("~/Desktop/Main/macedo_tract/macedo_tracometry-main/code/")
+source("gam_visualize_model.R")
+```
+
+### Load packages
+```{r}
+pkgs <- c("mgcv",  "gamm4", "tidyverse", "readxl", "mgcViz", "DHARMa", "gratia",
+  "ggforce", "marginaleffects", "dplyr", "ggplot2", "broom", "tidyr", "purrr", 
+  "cowplot", "patchwork", "plotly")
+invisible(lapply(pkgs, library, character.only = TRUE))
+library(knitr)
+```
+### Read in the data
+```{r}
+metrics = read.csv("~/Desktop/Main/macedo_tract/outputs/metrics_df.csv")
+main_metrics <- c('ad', 'area_of_end_region_1_mm2', 'area_of_end_region_2_mm2',
+       'branch_volume_mm3', 'curl', 'diameter_mm', 'dti_fa', 'elongation',
+       'gfa', 'ha', 'irregularity', 'irregularity_of_end_region_1',
+       'irregularity_of_end_region_2', 'md', 'mean_length_mm', 'qa',
+       'radius_of_end_region_1_mm', 'radius_of_end_region_2_mm', 'rd',
+       'rdi', 'span_mm',
+       'total_radius_of_end_regions_mm', 'total_surface_area_mm2',
+       'trunk_volume_mm3',
+       'volume_mm3')
+
+tract_dict = read.csv("~/Desktop/Main/macedo_tract/tract_types_2.csv")
+
+metrics <- metrics %>%
+  left_join(tract_dict, by = c("bundle" = "Tract.Name")) %>%
+  rename(tract_type = Type) 
+```
+
+```{r}
+bundles = data.frame(bundle = unique(metrics$bundle))
+bundles <- bundles %>%
+  left_join(tract_dict, by = c("bundle" = "Tract.Name")) %>%
+  rename(tract_type = Type) 
+```
+
+### Clean the data
+```{r}
+cleaned_metrics <- metrics %>%
+  drop_na(score, sex, interview_age, t1_neighbor_corr, brain_size) %>%
+  as.data.frame()
+
+cleaned_metrics$brain_size <- as.numeric(scale(cleaned_metrics$brain_size))
+cleaned_metrics$t1_neighbor_corr <- as.numeric(scale(cleaned_metrics$t1_neighbor_corr))
+cleaned_metrics$sex <- as.factor(cleaned_metrics$sex)
+cleaned_metrics$age = cleaned_metrics$interview_age/12
+```
+
+### Color by shape of curve
+```{r}
+color_by_shape <- function(modobj){
+  age_p = summary(modobj)$s.table["s(age)", "p-value"] # TODO: multiple test-correction for p-values?
+  if(age_p > 0.05) {
+    return("light gray") # do not plot if age term is not significant
+  }
+
+  derv<-derivatives(modobj, select = "s(age)")
+  derv<- derv %>%
+      mutate(sig = !(0 > .lower_ci & 0 < .upper_ci))
+  derv$sig_deriv = derv$.derivative*derv$sig # only plot deriv on the color bar if it is significant
+  
+  # if there is no significant change in derivative 
+  if (min(derv$sig_deriv) == 0 & max(derv$sig_deriv) == 0) {
+    return("light gray")
+  }
+  
+  if (min(derv$.derivative) > 0) {
+     return("red") # if always increasing
+     } else if (min(derv$.derivative) < 0 & max(derv$.derivative) < 0) {
+       return("blue") # if always decreasing
+       } else {
+         return("purple")
+       }
+}
+```
+
+```{r}
+color_by_type <- function(modobj, tract_type){
+  age_p = summary(modobj)$s.table["s(age)", "p-value"] # TODO: multiple test-correction for p-values?
+  if(age_p > 0.05) {
+    return("light gray") # do not plot if age term is not significant
+  }
+
+  if(tract_type[1] == "Association") { return("red")}
+  if(tract_type[1] =="Commissure") {return("blue")}
+  return("green") # projection
+}
+```
+
+### Calculate partial R^2 using deviance
+```{r}
+calculate_partial_R2 <- function(modobj, data, covariates) {
+  reduced_model <- gam(score ~ sex + t1_neighbor_corr, data = data, method = 'REML')
+  D_full <- deviance(modobj)
+  D_reduced <- deviance(reduced_model)
+  partial_r2 <- (D_reduced - D_full) / D_reduced
+  return(as.numeric(partial_r2, 3))
+}
+```
+
+### Assign thicker lines to higher partial_r^2
+```{r}
+r2_to_thickness <- function(partial_r2) {
+  line_sizes <- partial_r2 %>%
+  mutate(thickness = case_when(
+    r2 < 0.02     ~ 0.25,
+    r2 < 0.09     ~ 1,
+    r2 < 0.25     ~ 2.5,
+    TRUE          ~ 5  # r2 >= 0.25
+  ))
+  return(line_sizes)
+}
+```
+
+### GAM model - zero-centered smooths
+Color:
+<!-- red: increasing slope (significant derivative) -->
+<!-- blue: decreasing slope (significant derivative) -->
+<!-- purple: + and - slope (significant derivative) -->
+<!-- gray: p-value for age term not significant or derivative's confidence interval contains 0 at all points -->
+Association - red
+Commissure - blue
+Projection - green
+
+Line width:
+partial r2 < 0.02     ~ 0.25,
+partial r2 < 0.09     ~ 1,
+partial r2 < 0.25     ~ 2.5,
+partial >= 0.25         ~ 3  # r2 >= 0.25
+
+```{r}
+measure = "score"
+smooth_var = "age"
+covariates = "sex + t1_neighbor_corr"
+knots = 3
+font_size = 20
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+line_size = 1.5
+point_size = 2
+bundles = unique(cleaned_metrics$bundle)
+plot_list <- list()
+counter = 0 
+
+smooth_fits_all <- list()
+all_partial_r2 <- data.frame(metric = character(), bundle = character(), r2 = numeric())
+
+for (met in main_metrics) {
+  counter = counter + 1
+  metrics_span <- cleaned_metrics %>%
+    filter(metric == met)
+  
+  model_formula <- as.formula(sprintf("%s ~ s(%s, k=knots, fx = T) + %s", measure, smooth_var, covariates))
+  
+  colors <- metrics_span %>%
+    group_by(bundle) %>%
+    do(color = color_by_shape(gam(model_formula, data = ., method = 'REML')))
+  
+  partial_r2 <- metrics_span %>%
+    group_by(bundle) %>%
+    do(r2 = calculate_partial_R2(gam(model_formula, data = ., method = 'REML'), data = ., covariates = covariates))
+  
+  partial_r2 = r2_to_thickness(partial_r2)
+  partial_r2$r2 <- as.numeric(partial_r2$r2)
+  partial_r2$metric <- met
+  
+  # ✅ Collect all R² values
+  all_partial_r2 <- bind_rows(all_partial_r2, partial_r2)
+
+  smooth_fits <- metrics_span %>% 
+    group_by(bundle) %>% 
+    do(fit = smooth_estimates(gam(model_formula, data = ., method = 'REML'), n = 100)) %>% 
+    unnest(cols = fit) %>%
+    left_join(colors, by = "bundle")  %>%
+    left_join(partial_r2, by = "bundle") %>%
+    mutate(color = as.character(color))
+  
+  smooth_fits <- smooth_fits %>%
+    left_join(tract_dict, by = c("bundle" = "Tract.Name")) %>%
+    rename(tract_type = Type) %>%
+    mutate(metric = met)
+  
+  smooth_fits_all[[counter]] = smooth_fits
+  
+  print(plot_zero.centered_smooths(smooth_fits, ylab = met, thickness = smooth_fits$thickness))
+}
+
+# Rank metrics by mean R² and print
+ranked_metrics <- all_partial_r2 %>%
+  group_by(metric) %>%
+  summarise(mean_r2 = mean(r2, na.rm = TRUE)) %>%
+  arrange(desc(mean_r2))
+
+cat("Metrics ranked by mean Partial R² (age-effect):\n")
+print(ranked_metrics)
+
+# Optional: Visualize R² ranking
+ggplot(ranked_metrics, aes(x = reorder(metric, mean_r2), y = mean_r2)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Metrics Ranked by Age-Effect (Partial R²)", x = "Metric", y = "Mean Partial R²") +
+  theme_minimal(base_size = font_size)
+
+```
+```{r fig.width=15, fig.height=12, dpi=300}
+ggplot(ranked_metrics, aes(x = reorder(metric, mean_r2), y = mean_r2)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(
+    title = "Metrics Ranked by Age-Effect (Partial R²)", 
+    x = "Metric", 
+    y = "Mean Partial R²"
+  ) +
+  theme_minimal(base_size = font_size + 4) +  # Increase base font size
+  theme(
+    plot.title = element_text(size = font_size + 6, face = "bold"),
+    axis.title = element_text(size = font_size + 4),
+    axis.text.y = element_text(size = font_size + 2),
+    axis.text.x = element_text(size = font_size + 2),
+    plot.margin = margin(20, 20, 20, 20),  # Adjust margins around the plot
+    panel.grid.major.y = element_blank()   # Remove horizontal grid lines for clarity
+  )
+```
+### Age effects of each metric per bundle
+```{r fig.width=15, fig.height=12, dpi=300}
+
+measure = "score"
+smooth_var = "age"
+covariates = "sex + t1_neighbor_corr"
+knots = 3
+significance_threshold <- 0.05  # P-value threshold for significance
+
+font_size = 20
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+
+heatmap_data <- data.frame(metric = character(), bundle = character(), r2 = numeric(), p_value = numeric())
+
+end_region_metrics <- c('area_of_end_region_1_mm2', 'area_of_end_region_2_mm2',
+                        'irregularity_of_end_region_1',
+       'irregularity_of_end_region_2', 
+       'radius_of_end_region_1_mm', 'radius_of_end_region_2_mm', 
+       'total_radius_of_end_regions_mm')
+
+# Loop through each metric and bundle to compute R² and p-value
+for (met in end_region_metrics) {
+  metrics_span <- cleaned_metrics %>%
+    filter(metric == met)
+  
+  for (b in unique(metrics_span$bundle)) {
+    bundle_data <- metrics_span %>%
+      filter(bundle == b)
+    
+    if (nrow(bundle_data) > 0) {
+      model_formula <- as.formula(sprintf("%s ~ s(%s, k=%d, fx=T) + %s", measure, smooth_var, knots, covariates))
+      gam_model <- gam(model_formula, data = bundle_data, method = 'REML')
+      
+      # Extract partial R²
+      partial_r2 <- calculate_partial_R2(gam_model, data = bundle_data, covariates = covariates)
+      
+      # Extract p-value for age term
+      age_p <- summary(gam_model)$s.table["s(age)", "p-value"]
+      
+      # Store results
+      heatmap_data <- rbind(
+        heatmap_data,
+        data.frame(metric = met, bundle = b, r2 = as.numeric(partial_r2), p_value = age_p)
+      )
+    }
+  }
+}
+
+# Mask R² values where p-value is not significant
+heatmap_data <- heatmap_data %>%
+  mutate(r2_masked = ifelse(p_value < significance_threshold, r2, NA))
+
+```
+
+
+```{r fig.width=20, fig.height=25, dpi=300}
+# Create heatmap with bundles on Y-axis and extended height
+ggplot(heatmap_data, aes(x = metric, y = bundle, fill = r2_masked)) +
+  geom_tile(color = "white") +  # White gridlines
+  scale_fill_gradient(
+    low = "white", high = "steelblue", na.value = "white",  # White for non-significant
+    name = "Partial R²"
+  ) +
+  labs(
+    title = "Heatmap of Age-Effect (Partial R²) per Bundle and Metric",
+    x = "Metric",
+    y = "Bundle"
+  ) +
+  theme_minimal(base_size = font_size) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),  # Rotate X-axis labels for clarity
+    axis.text.y = element_text(size = font_size),                    # Keep Y-axis readable
+    plot.title = element_text(hjust = 0.5, size = font_size + 4),
+    legend.title = element_text(size = font_size + 2),
+    legend.text = element_text(size = font_size),
+    plot.margin = margin(30, 30, 30, 30)                             # Extra space around the plot
+  )
+
+ggsave("ageeffects_plot.png", width = 20, height = 25, dpi = 300)
+```
+
+### Male vs female models and compatison
+```{r}
+measure = "score"
+smooth_var = "age"
+knots = 3
+font_size = 20
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+significance_threshold <- 0.05  # P-value threshold for significance'
+
+cleaned_metrics$sex <- factor(cleaned_metrics$sex, levels = c(0, 1))
+all_partial_r2_sex <- data.frame(metric = character(), bundle = character(), sex = character(), r2 = numeric())
+heatmap_data_sex <- data.frame(metric = character(), bundle = character(), sex = character(), r2 = numeric(), p_value = numeric())
+
+for (met in main_metrics) {
+  metrics_span <- cleaned_metrics %>%
+    filter(metric == met)
+
+  for (b in unique(metrics_span$bundle)) {
+    for (gender in c(0, 1)) {  # Assuming 0 = Female, 1 = Male
+      bundle_data <- metrics_span %>%
+        filter(bundle == b, sex == gender)
+      
+      # Convert 'sex' to numeric to avoid factor contrast issues
+      bundle_data$sex <- as.numeric(as.character(bundle_data$sex))
+
+      if (nrow(bundle_data) > 0) {
+        model_formula <- as.formula(sprintf("%s ~ s(%s, k=%d, fx=T) + t1_neighbor_corr",
+                                            measure, smooth_var, knots))
+        gam_model <- gam(model_formula, data = bundle_data, method = 'REML')
+
+        # Extract partial R² and p-value
+        partial_r2 <- calculate_partial_R2(gam_model, data = bundle_data, covariates = "t1_neighbor_corr")
+        age_p <- summary(gam_model)$s.table["s(age)", "p-value"]
+
+        # Store results
+        all_partial_r2_sex <- rbind(
+          all_partial_r2_sex,
+          data.frame(metric = met, bundle = b, sex = gender, r2 = as.numeric(partial_r2))
+        )
+      }
+    }
+  }
+}
+
+
+print(head(all_partial_r2_sex))
+
+# Mask non-significant R² values
+heatmap_data_sex <- heatmap_data_sex %>%
+  mutate(r2_masked = ifelse(p_value < significance_threshold, r2, NA))
+
+# Recode 'sex' column from 1/0 to "Male"/"Female"
+all_partial_r2_sex <- all_partial_r2_sex %>%
+  mutate(sex = ifelse(sex == 1, "Male", "Female"))
+
+# Compare Average Age Effects (Male vs. Female)
+avg_age_effects <- all_partial_r2_sex %>%
+  group_by(metric, sex) %>%
+  summarise(mean_r2 = mean(r2, na.rm = TRUE), .groups = 'drop') %>%
+  pivot_wider(names_from = sex, values_from = mean_r2) %>%
+  mutate(difference = Male - Female)  # 💡 Now should work without error
+
+# Plot the comparison
+ggplot(avg_age_effects, aes(x = Male, y = Female, label = metric)) +
+  geom_point(color = "darkgreen", size = 3) +
+  geom_text(vjust = -0.5, size = 4) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Comparison of Average Age Effects (Partial R²) in Male vs. Female Models",
+    x = "Male Model (Mean Partial R²)",
+    y = "Female Model (Mean Partial R²)"
+  ) +
+  theme_minimal(base_size = font_size) +
+  theme(plot.title = element_text(size = font_size + 4, face = "bold"))
+```
+
+```{r fig.width=20, fig.height=25, dpi=300}
+# 💡 Heatmap: Male vs. Female
+heatmap_data_sex <- all_partial_r2_sex %>%
+  pivot_wider(names_from = sex, values_from = r2) %>%
+  mutate(difference = Male - Female)
+
+ggplot(heatmap_data_sex, aes(x = metric, y = bundle, fill = difference)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name = "Partial R² Diff") +
+  labs(title = "Heatmap of Age-Effect Difference (Male vs. Female)", x = "Metric", y = "Bundle") +
+  theme_minimal(base_size = font_size) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+```
+
+```{r fig.width=20, fig.height=25, dpi=300}
+cleaned_metrics$sex <- as.numeric(as.character(cleaned_metrics$sex))
+
+# 🔍 Metrics of interest
+end_region_metrics <- c('area_of_end_region_1_mm2', 'area_of_end_region_2_mm2',
+                        'irregularity_of_end_region_1', 'irregularity_of_end_region_2', 
+                        'radius_of_end_region_1_mm', 'radius_of_end_region_2_mm', 
+                        'total_radius_of_end_regions_mm')
+
+measure = "score"
+smooth_var = "age"
+covariates = "t1_neighbor_corr"  # Exclude 'sex' for sex-stratified analysis
+knots = 3
+font_size = 16
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+significance_threshold <- 0.05
+
+# Initialize data frames
+heatmap_data_sex <- data.frame(metric = character(), bundle = character(), sex = character(), r2 = numeric(), p_value = numeric())
+
+# Loop for each metric and sex
+for (met in end_region_metrics) {
+  metrics_span <- cleaned_metrics %>%
+    filter(metric == met)
+  
+  for (gender in c(0, 1)) {
+    sex_label <- ifelse(gender == 1, "Male", "Female")
+    metrics_sex <- metrics_span %>% filter(sex == gender)
+    
+    for (b in unique(metrics_sex$bundle)) {
+      bundle_data <- metrics_sex %>%
+        filter(bundle == b)
+      
+      if (nrow(bundle_data) > 1) {  # ⚡ Ensure sufficient data points
+        model_formula <- as.formula(sprintf("%s ~ s(%s, k=%d, fx=T) + %s", measure, smooth_var, knots, covariates))
+        gam_model <- gam(model_formula, data = bundle_data, method = 'REML')
+        
+        # 🎯 Extract partial R²
+        partial_r2 <- calculate_partial_R2(gam_model, data = bundle_data, covariates = covariates)
+        age_p <- summary(gam_model)$s.table["s(age)", "p-value"]
+        
+        # 💾 Store results
+        heatmap_data_sex <- rbind(
+          heatmap_data_sex,
+          data.frame(metric = met, bundle = b, sex = sex_label, r2 = as.numeric(partial_r2), p_value = age_p)
+        )
+      }
+    }
+  }
+}
+
+# Mask non-significant R² values
+heatmap_data_sex <- heatmap_data_sex %>%
+  mutate(r2_masked = ifelse(p_value < significance_threshold, r2, NA))
+
+# Common scale across plots
+max_r2 <- max(heatmap_data_sex$r2_masked, na.rm = TRUE)
+
+# Heatmap for Males
+heatmap_male <- heatmap_data_sex %>%
+  filter(sex == "Male") %>%
+  ggplot(aes(x = metric, y = bundle, fill = r2_masked)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    low = "white", high = "steelblue", na.value = "white", 
+    limits = c(0, max_r2), name = "Partial R²"
+  ) +
+  labs(title = "Age-Effect Heatmap (Male)", x = "Metric", y = "Bundle") +
+  theme_minimal(base_size = font_size) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Heatmap for Females
+heatmap_female <- heatmap_data_sex %>%
+  filter(sex == "Female") %>%
+  ggplot(aes(x = metric, y = bundle, fill = r2_masked)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    low = "white", high = "steelblue", na.value = "white", 
+    limits = c(0, max_r2), name = "Partial R²"
+  ) +
+  labs(title = "Age-Effect Heatmap (Female)", x = "Metric", y = "Bundle") +
+  theme_minimal(base_size = font_size) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Combine Male and Female heatmaps side-by-side
+(heatmap_male | heatmap_female) +
+  plot_annotation(title = "Comparison of Age Effects by Sex (Selected End Region Metrics)",
+                  theme = theme(plot.title = element_text(size = font_size + 4, hjust = 0.5, face = "bold")))
+ggsave("ageeffects_by_sex_plot.png", width = 20, height = 25, dpi = 300)
+```
+```{r fig.width=20, fig.height=25, dpi=300}
+cleaned_metrics$sex <- ifelse(cleaned_metrics$sex == 1, "Male", "Female")
+
+# Loop to calculate mean partial R² by metric and sex
+mean_r2_by_sex <- all_partial_r2_sex %>%
+  group_by(metric, sex) %>%
+  summarise(mean_r2 = mean(r2, na.rm = TRUE), .groups = "drop")
+
+# Ensure common y-axis scale across both plots
+max_r2 <- max(mean_r2_by_sex$mean_r2, na.rm = TRUE)
+
+# Plot for Males
+male_plot <- mean_r2_by_sex %>%
+  filter(sex == "Male") %>%
+  ggplot(aes(x = reorder(metric, mean_r2), y = mean_r2)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  ylim(0, max_r2) +  # ⚡ Common scale
+  labs(
+    title = "Mean Age-Effect (Partial R²) - Male",
+    x = "Metric",
+    y = "Mean Partial R²"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 16)
+  )
+
+# Plot for Females
+female_plot <- mean_r2_by_sex %>%
+  filter(sex == "Female") %>%
+  ggplot(aes(x = reorder(metric, mean_r2), y = mean_r2)) +
+  geom_bar(stat = "identity", fill = "lightpink") +
+  coord_flip() +
+  ylim(0, max_r2) +  # ⚡ Common scale
+  labs(
+    title = "Mean Age-Effect (Partial R²) - Female",
+    x = "Metric",
+    y = "Mean Partial R²"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 16)
+  )
+
+# Combine plots side by side
+(male_plot | female_plot) +
+  plot_annotation(
+    title = "Comparison of Mean Age-Effects by Sex (Across All Bundles)",
+    theme = theme(plot.title = element_text(size = 20, hjust = 0.5, face = "bold"))
+  )
+```
+
+```{r}
+smooth_fits_final = bind_rows(smooth_fits_all)
+smooth_fits_final <- smooth_fits_final %>%
+  mutate(across(where(is.list), ~sapply(., function(x) if (length(x) == 1) x else NA)))
+write.csv(smooth_fits_final, "~/Desktop/Main/macedo_tract/outputs/smooth_fits_100.csv", row.names = FALSE)
+```
+
+### SLF and TR
+
+```{r fig.width=25, fig.height=15, dpi=300}
+library(ggrepel)
+library(patchwork)  # For combining plots
+
+measure = "score"
+smooth_var = "age"
+covariates = "sex + t1_neighbor_corr"
+knots = 3
+font_size = 20
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+line_size = 1.5
+point_size = 2
+highlight_bundles <- c("SuperiorLongitudinalFasciculus1L", "SuperiorLongitudinalFasciculus1R",
+                       "FornixR", "FornixL", "ThalamicRadiationAnteriorL", "ThalamicRadiationAnteriorR")
+
+assign_bundle_colors <- function(bundle) {
+  colors_map <- c(
+    "SuperiorLongitudinalFasciculus1L" = "red",
+    "SuperiorLongitudinalFasciculus1R" = "blue",
+    "FornixR" = "green",
+    "FornixL" = "orange",
+    "ThalamicRadiationAnteriorL" = "purple",
+    "ThalamicRadiationAnteriorR" = "brown"
+  )
+  return(colors_map[bundle])
+}
+
+bundles = highlight_bundles
+plot_list <- list()
+counter = 0 
+
+smooth_fits_all <- list()
+all_partial_r2 <- data.frame(metric = character(), bundle = character(), r2 = numeric())
+
+for (met in end_region_metrics) {
+  counter = counter + 1
+  metrics_span <- cleaned_metrics %>%
+    filter(metric == met & bundle %in% highlight_bundles)
+
+  model_formula <- as.formula(sprintf("%s ~ s(%s, k=knots, fx = T) + %s", measure, smooth_var, covariates))
+
+  partial_r2 <- metrics_span %>%
+    group_by(bundle) %>%
+    do(r2 = calculate_partial_R2(gam(model_formula, data = ., method = 'REML'), data = ., covariates = covariates))
+
+  partial_r2 = r2_to_thickness(partial_r2)
+  partial_r2$r2 <- as.numeric(partial_r2$r2)
+  partial_r2$metric <- met
+
+  all_partial_r2 <- bind_rows(all_partial_r2, partial_r2)
+
+  smooth_fits <- metrics_span %>% 
+    group_by(bundle) %>% 
+    do(fit = smooth_estimates(gam(model_formula, data = ., method = 'REML'), n = 100)) %>% 
+    unnest(cols = fit) %>%
+    left_join(partial_r2, by = "bundle") %>%
+    mutate(color = assign_bundle_colors(bundle)) %>%
+    left_join(tract_dict, by = c("bundle" = "Tract.Name")) %>%
+    rename(tract_type = Type) %>%
+    mutate(metric = met)
+
+  smooth_fits_all[[counter]] = smooth_fits
+
+  p <- ggplot(smooth_fits, aes(x = age, y = .estimate, color = bundle, group = bundle)) +
+    geom_line(linewidth = line_size) +
+    scale_color_manual(
+      values = setNames(assign_bundle_colors(highlight_bundles), highlight_bundles),
+      breaks = highlight_bundles,
+      name = "Highlighted Bundles"
+    ) +
+    labs(y = met, x = "Age") +
+    theme(legend.position = "right")
+
+  plot_list[[counter]] <- p
+}
+
+# Combine all plots into one subplot
+combined_plot <- wrap_plots(plotlist = plot_list, ncol = 2)
+print(combined_plot)
+
+ranked_metrics <- all_partial_r2 %>%
+  group_by(metric) %>%
+  summarise(mean_r2 = mean(r2, na.rm = TRUE)) %>%
+  arrange(desc(mean_r2))
+
+cat("Metrics ranked by mean Partial R² (age-effect):\n")
+print(ranked_metrics)
+
+ggplot(ranked_metrics, aes(x = reorder(metric, mean_r2), y = mean_r2)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Metrics Ranked by Age-Effect (Partial R²)", x = "Metric", y = "Mean Partial R²") +
+  theme_minimal(base_size = font_size)
+
+```
+
+```
+
+### PCA - sanity check, compared to PCA from python
+```{r}
+smooth_fits_small = smooth_fits_final %>%
+  select(bundle, .estimate, age, metric)
+
+metric_fits <- smooth_fits_small %>% 
+  filter(smooth_fits_small$metric == "gfa") %>%
+  select(-metric)
+
+smooth_fits_wide <- metric_fits %>%
+  pivot_wider(names_from = age, values_from = .estimate) %>%
+  select(-bundle)
+
+gfa_PCA <- prcomp(smooth_fits_wide, center = TRUE, scale = TRUE)
+factoextra::fviz_eig(gfa_PCA)
+pca_loadings <- as.data.frame(gfa_PCA$rotation[,1:3])
+pca_loadings$age <- as.numeric(row.names(pca_loadings))
+ggplot(pca_loadings, aes(age, PC1)) + geom_point() + labs(title = "PC1", x = "Predicted Age", y = "PC1 loading") + theme_minimal()
+```
+
+### GAM - separate plots, by metric
+```{r, fig.height=40, fig.width=40, eval=FALSE}
+measure = "score"
+smooth_var = "age"
+covariates = "sex + t1_neighbor_corr"
+knots = 3
+font_size = 14
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+line_size = 1.5
+point_size = 2
+bundles = unique(cleaned_metrics$bundle)
+
+end_region_metrics <- c('area_of_end_region_1_mm2', 'area_of_end_region_2_mm2',
+                        'irregularity_of_end_region_1', 'irregularity_of_end_region_2', 
+                        'radius_of_end_region_1_mm', 'radius_of_end_region_2_mm', 
+                        'total_radius_of_end_regions_mm')
+
+for (met in mnd_region_metrics) {
+
+  plots <- list()
+  counter <- 0
+
+  for (bund in bundles) {
+    counter = counter + 1
+    metrics_span <- cleaned_metrics %>%
+    filter(metric == met, bundle == bund)
+
+    model_formula <- as.formula(sprintf("%s ~ s(%s, k=knots, fx = T) + %s", measure, smooth_var, covariates))
+    gam_model <- gam(model_formula, data = metrics_span, method = 'REML')
+    
+    p = visualize_model(modobj = gam_model, smooth_var = smooth_var, group_var = "sub", int_var="sex", custom_color="red", plabels=bund, derivative_plot = T, print_on = FALSE)
+
+    plots[[counter]] = p
+  }
+
+  combined_plot <- plot_grid(plotlist = plots, ncol = 8)
+  final_plot_with_title <- plot_grid(
+    ggdraw() + draw_label(met, fontface = 'bold', size = 30),
+    combined_plot, ncol = 1, rel_heights = c(0.1, 1))
+  print(final_plot_with_title)
+}
+```
+
+### GAM - separate plots, by bundle
+```{r, fig.height=40, fig.width=40, eval=FALSE}
+measure = "score"
+smooth_var = "age"
+covariates = "sex + t1_neighbor_corr"
+knots = 3
+font_size <- 14
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+line_size <- 1.5
+point_size <- 2
+bundles = unique(cleaned_metrics$bundle)
+i
+
+
+main_metrics <- c()
+
+for (bund in bundles) {
+  plots <- list()
+  counter <- 0
+  
+  for (met in main_metrics ) {
+    counter = counter + 1
+    metrics_span <- cleaned_metrics %>%
+    filter(metric == met, bundle == bund)
+    
+    model_formula <- as.formula(sprintf("%s ~ s(%s, k=knots, fx = T) + %s", measure, smooth_var, covariates)) 
+    gam_model <- gam(model_formula, data = metrics_span, method = 'REML')
+    # print(bund)
+    # print(summary(gam_model))
+    # print(anova(gam_model, test = "F", type = "R2"))
+  
+    p = visualize_model(modobj = gam_model, smooth_var = smooth_var, group_var = "sub", int_var="sex", custom_color="red", plabels=met, derivative_plot = T, print_on = FALSE)
+    
+    plots[[counter]] = p
+    
+  }
+  
+  combined_plot <- plot_grid(plotlist = plots, ncol = 5)
+  final_plot_with_title <- plot_grid(
+  ggdraw() + draw_label(bund, fontface = 'bold', size = 30),
+  combined_plot, ncol = 1, rel_heights = c(0.1, 1))
+  print(final_plot_with_title)
+}
+
+```
+
+
+### PCA - sanity check, compared to PCA from python
+
+```{r}
+smooth_fits_small = smooth_fits_final %>%
+  select(bundle, .estimate, age, metric)
+
+metric_fits <- smooth_fits_small %>% 
+  filter(smooth_fits_small$metric == "gfa") %>%
+  select(-metric)
+
+smooth_fits_wide <- metric_fits %>%
+  pivot_wider(names_from = age, values_from = .estimate) %>%
+  select(-bundle)
+
+gfa_PCA <- prcomp(smooth_fits_wide, center = TRUE, scale = TRUE)
+factoextra::fviz_eig(gfa_PCA)
+pca_loadings <- as.data.frame(gfa_PCA$rotation[,1:3])
+pca_loadings$age <- as.numeric(row.names(pca_loadings))
+ggplot(pca_loadings, aes(age, PC1)) + geom_point() + labs(title = "PC1", x = "Predicted Age", y = "PC1 loading") + theme_minimal()
+```
+
+### GAM - separate plots, by metric
+```{r, fig.height=40, fig.width=40, eval=FALSE}
+measure = "score"
+smooth_var = "age"
+covariates = "sex + t1_neighbor_corr"
+knots = 3
+font_size = 14
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+line_size = 1.5
+point_size = 2
+bundles = unique(cleaned_metrics$bundle)
+
+for (met in main_metrics) {
+
+  plots <- list()
+  counter <- 0
+
+  for (bund in bundles) {
+    counter = counter + 1
+    metrics_span <- cleaned_metrics %>%
+    filter(metric == met, bundle == bund)
+
+    model_formula <- as.formula(sprintf("%s ~ s(%s, k=knots, fx = T) + %s", measure, smooth_var, covariates))
+    gam_model <- gam(model_formula, data = metrics_span, method = 'REML')
+    
+    p = visualize_model(modobj = gam_model, smooth_var = smooth_var, group_var = "sub", int_var="sex", custom_color="red", plabels=bund, derivative_plot = T, print_on = FALSE)
+
+    plots[[counter]] = p
+  }
+
+  combined_plot <- plot_grid(plotlist = plots, ncol = 8)
+  final_plot_with_title <- plot_grid(
+    ggdraw() + draw_label(met, fontface = 'bold', size = 30),
+    combined_plot, ncol = 1, rel_heights = c(0.1, 1))
+  print(final_plot_with_title)
+}
+```
+
+### GAM - separate plots, by bundle
+```{r, fig.height=40, fig.width=40, eval=FALSE}
+measure = "score"
+smooth_var = "age"
+covariates = "sex + t1_neighbor_corr"
+knots = 3
+font_size <- 14
+theme_set(theme_classic(base_family = "sans", base_size = font_size))
+line_size <- 1.5
+point_size <- 2
+bundles = unique(cleaned_metrics$bundle)
+
+main_metrics <- c()
+
+for (bund in bundles) {
+  plots <- list()
+  counter <- 0
+  
+  for (met in main_metrics ) {
+    counter = counter + 1
+    metrics_span <- cleaned_metrics %>%
+    filter(metric == met, bundle == bund)
+    
+    model_formula <- as.formula(sprintf("%s ~ s(%s, k=knots, fx = T) + %s", measure, smooth_var, covariates)) 
+    gam_model <- gam(model_formula, data = metrics_span, method = 'REML')
+    # print(bund)
+    # print(summary(gam_model))
+    # print(anova(gam_model, test = "F", type = "R2"))
+  
+    p = visualize_model(modobj = gam_model, smooth_var = smooth_var, group_var = "sub", int_var="sex", custom_color="red", plabels=met, derivative_plot = T, print_on = FALSE)
+    
+    plots[[counter]] = p
+    
+  }
+  
+  combined_plot <- plot_grid(plotlist = plots, ncol = 5)
+  final_plot_with_title <- plot_grid(
+  ggdraw() + draw_label(bund, fontface = 'bold', size = 30),
+  combined_plot, ncol = 1, rel_heights = c(0.1, 1))
+  print(final_plot_with_title)
+}
+
+```
+  
+
+
